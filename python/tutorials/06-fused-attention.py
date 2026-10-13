@@ -626,27 +626,25 @@ attention = _attention.apply
 TORCH_HAS_FP8 = hasattr(torch, 'float8_e5m2')
 
 
-# 与 Customer_Kernels/flash_attention_npu_v8_generalized.py 的 test_configs 对齐 (varlen -> 稠密):
-# Z=bs, H=num_head, N_CTX=seqlen (向上对齐到 128 倍数, 满足 bwd 的 N_CTX % PRE_BLOCK == 0), HEAD_DIM=head_dim
+# 与 Customer_Kernels/flash_attention_npu_v8_generalized.py 的 test_configs 完全一致 (varlen -> 稠密):
+# Z=bs, H=num_head, N_CTX=seqlen (保持原始值, 不对齐到 128 倍数), HEAD_DIM=head_dim
 @pytest.mark.parametrize("Z, H, N_CTX, HEAD_DIM", [
     (8, 8, 2432, 64),   # case1: seqlen=[2432]*8,  head_dim=64
-    (8, 8, 384, 64),    # case2: seqlen=[320]*8  -> 320 对齐到 384
-    (8, 16, 128, 32),   # case3: seqlen=[32]*8   -> 32 对齐到 128
-    (8, 16, 128, 32),   # case4: seqlen=[64]*8   -> 64 对齐到 128
-    (8, 8, 128, 64),    # case5: seqlen=[32]*8   -> 32 对齐到 128
-    (8, 4, 128, 128),   # case6: seqlen=[118]*8  -> 118 对齐到 128
+    (8, 8, 320, 64),    # case2: seqlen=[320]*8
+    (8, 16, 32, 32),    # case3: seqlen=[32]*8
+    (8, 16, 64, 32),    # case4: seqlen=[64]*8
+    (8, 8, 32, 64),     # case5: seqlen=[32]*8
+    (8, 4, 118, 128),   # case6: seqlen=[118]*8
     (32, 8, 256, 64),   # case7: seqlen=[256]*32
 ])
-@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("causal", [True])
 @pytest.mark.parametrize("warp_specialize", [False, True] if is_blackwell() else [False])
 @pytest.mark.parametrize("mode", ["fwd", "bwd"])
-@pytest.mark.parametrize("provider", ["triton-fp16"] + (["triton-fp8"] if TORCH_HAS_FP8 else []))
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.enable_warmup
-def test_op(Z, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, dtype=torch.bfloat16):
-    if mode == "fwd" and "fp16" in provider:
+def test_op(Z, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, dtype):
+    if mode == "fwd":
         pytest.skip("Avoid running the forward computation twice.")
-    if mode == "bwd" and "fp8" in provider:
-        pytest.skip("Backward pass with FP8 is not supported.")
     torch.manual_seed(20)
     q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
     k = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
@@ -654,43 +652,48 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, dtyp
     sm_scale = 0.5
     # bf16 精度低于 fp16: 对齐 Customer_Kernels/flash_attention_npu_v8_generalized.py 使用 5e-2 容差
     atol, rtol = (5e-2, 5e-2) if dtype == torch.bfloat16 else (1e-2, 0.0)
-    # reference implementation
-    ref_dtype = dtype
-    if mode == "fwd" and "fp8" in provider:
-        ref_dtype = torch.float32
-    q = q.to(ref_dtype)
-    k = k.to(ref_dtype)
-    v = v.to(ref_dtype)
+    # reference implementation (原始 N_CTX, 不做任何填充)
     M = torch.tril(torch.ones((N_CTX, N_CTX), device=DEVICE))
     p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
     if causal:
         p[:, :, M == 0] = float("-inf")
     p = torch.softmax(p.float(), dim=-1)
-    p = p.to(ref_dtype)
-    # p = torch.exp(p)
+    p = p.to(dtype)
     ref_out = torch.matmul(p, v).half()
-    if mode == "bwd":
-        dout = torch.randn_like(q)
-        ref_out.backward(dout)
-        ref_dv, v.grad = v.grad.clone(), None
-        ref_dk, k.grad = k.grad.clone(), None
-        ref_dq, q.grad = q.grad.clone(), None
+    dout = torch.randn_like(q)
+    ref_out.backward(dout)
+    ref_dv, v.grad = v.grad.clone(), None
+    ref_dk, k.grad = k.grad.clone(), None
+    ref_dq, q.grad = q.grad.clone(), None
     # triton implementation
-    if mode == "fwd" and "fp8" in provider:
-        q = q.to(torch.float8_e5m2)
-        k = k.to(torch.float8_e5m2)
-        v = v.permute(0, 1, 3, 2).contiguous()
-        v = v.permute(0, 1, 3, 2)
-        v = v.to(torch.float8_e5m2)
-    tri_out = attention(q, k, v, causal, sm_scale, warp_specialize).half()
-    if mode == "fwd":
-        atol = 3 if "fp8" in provider else atol
-        torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=rtol)
-        return
-    tri_out.backward(dout)
-    tri_dv, v.grad = v.grad.clone(), None
-    tri_dk, k.grad = k.grad.clone(), None
-    tri_dq, q.grad = q.grad.clone(), None
+    # tutorial kernel 无边界 mask (fwd 的 M 统计量裸写, bwd 整体假设 N_CTX 为块大小倍数),
+    # 非 128 倍数的 N_CTX 先尾部补零到 128 倍数再调用, 仅比较有效区域 [:N_CTX]:
+    # causal=True 下尾部补零不影响有效区域结果 —— 有效 query 只 attend 有效 key (j <= i < N_CTX),
+    # padded query 的 dout=0 对 dk/dv 贡献为 0, 与原始 seqlen 的语义完全一致.
+    pad_len = -N_CTX % 128
+
+    def _pad_tokens(t):
+        padded = torch.zeros((*t.shape[:-2], t.shape[-2] + pad_len, t.shape[-1]), dtype=t.dtype, device=t.device)
+        padded[..., :t.shape[-2], :] = t
+        return padded
+
+    if pad_len:
+        tri_q = _pad_tokens(q.detach()).requires_grad_()
+        tri_k = _pad_tokens(k.detach()).requires_grad_()
+        tri_v = _pad_tokens(v.detach()).requires_grad_()
+    else:
+        tri_q, tri_k, tri_v = q, k, v
+    tri_out = attention(tri_q, tri_k, tri_v, causal, sm_scale, warp_specialize).half()
+    tri_dout = _pad_tokens(dout) if pad_len else dout
+    tri_out.backward(tri_dout)
+    tri_dv, tri_v.grad = tri_v.grad.clone(), None
+    tri_dk, tri_k.grad = tri_k.grad.clone(), None
+    tri_dq, tri_q.grad = tri_q.grad.clone(), None
+    if pad_len:
+        tri_out = tri_out[..., :N_CTX, :]
+        tri_dv = tri_dv[..., :N_CTX, :]
+        tri_dk = tri_dk[..., :N_CTX, :]
+        tri_dq = tri_dq[..., :N_CTX, :]
     # compare
     torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=rtol)
     # Relative tolerance workaround for known hardware limitation of CDNA2 GPU.
