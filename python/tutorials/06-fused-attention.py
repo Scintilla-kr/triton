@@ -139,8 +139,10 @@ configs = [
 ]
 if "PYTEST_VERSION" in os.environ:
     # Use a single config in testing for reproducibility
+    # (BLOCK_N=32 配置用于 HEAD_DIM=32 的 case, 见 _attn_fwd 内 static_assert(BLOCK_N <= HEAD_DIM))
     configs = [
         triton.Config(dict(BLOCK_M=128, BLOCK_N=64), num_stages=2, num_warps=4, pre_hook=_host_descriptor_pre_hook),
+        triton.Config(dict(BLOCK_M=64, BLOCK_N=32), num_stages=2, num_warps=4, pre_hook=_host_descriptor_pre_hook),
     ]
 
 
@@ -154,12 +156,15 @@ def keep(conf):
 def prune_invalid_configs(configs, named_args, **kwargs):
     N_CTX = kwargs["N_CTX"]
     STAGE = kwargs["STAGE"]
+    HEAD_DIM = kwargs["HEAD_DIM"]
 
     # Filter out configs where BLOCK_M > N_CTX
     # Filter out configs where BLOCK_M < BLOCK_N when causal is True
+    # Filter out configs where BLOCK_N > HEAD_DIM (required by static_assert in _attn_fwd)
     return [
         conf for conf in configs if conf.kwargs.get("BLOCK_M", 0) <= N_CTX and (
             conf.kwargs.get("BLOCK_M", 0) >= conf.kwargs.get("BLOCK_N", 0) or STAGE == 1)
+        and conf.kwargs.get("BLOCK_N", 0) <= HEAD_DIM
     ]
 
 
@@ -621,16 +626,23 @@ attention = _attention.apply
 TORCH_HAS_FP8 = hasattr(torch, 'float8_e5m2')
 
 
-@pytest.mark.parametrize("Z", [1, 4])
-@pytest.mark.parametrize("H", [2, 48])
-@pytest.mark.parametrize("N_CTX", [128, 1024, (2 if is_hip() else 4) * 1024])
-@pytest.mark.parametrize("HEAD_DIM", [64, 128])
+# 与 Customer_Kernels/flash_attention_npu_v8_generalized.py 的 test_configs 对齐 (varlen -> 稠密):
+# Z=bs, H=num_head, N_CTX=seqlen (向上对齐到 128 倍数, 满足 bwd 的 N_CTX % PRE_BLOCK == 0), HEAD_DIM=head_dim
+@pytest.mark.parametrize("Z, H, N_CTX, HEAD_DIM", [
+    (8, 8, 2432, 64),   # case1: seqlen=[2432]*8,  head_dim=64
+    (8, 8, 384, 64),    # case2: seqlen=[320]*8  -> 320 对齐到 384
+    (8, 16, 128, 32),   # case3: seqlen=[32]*8   -> 32 对齐到 128
+    (8, 16, 128, 32),   # case4: seqlen=[64]*8   -> 64 对齐到 128
+    (8, 8, 128, 64),    # case5: seqlen=[32]*8   -> 32 对齐到 128
+    (8, 4, 128, 128),   # case6: seqlen=[118]*8  -> 118 对齐到 128
+    (32, 8, 256, 64),   # case7: seqlen=[256]*32
+])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("warp_specialize", [False, True] if is_blackwell() else [False])
 @pytest.mark.parametrize("mode", ["fwd", "bwd"])
 @pytest.mark.parametrize("provider", ["triton-fp16"] + (["triton-fp8"] if TORCH_HAS_FP8 else []))
 @pytest.mark.enable_warmup
-def test_op(Z, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, dtype=torch.float16):
+def test_op(Z, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, dtype=torch.bfloat16):
     if mode == "fwd" and "fp16" in provider:
         pytest.skip("Avoid running the forward computation twice.")
     if mode == "bwd" and "fp8" in provider:
@@ -640,6 +652,8 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, dtyp
     k = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
     v = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
     sm_scale = 0.5
+    # bf16 精度低于 fp16: 对齐 Customer_Kernels/flash_attention_npu_v8_generalized.py 使用 5e-2 容差
+    atol, rtol = (5e-2, 5e-2) if dtype == torch.bfloat16 else (1e-2, 0.0)
     # reference implementation
     ref_dtype = dtype
     if mode == "fwd" and "fp8" in provider:
@@ -670,23 +684,22 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, dtyp
         v = v.to(torch.float8_e5m2)
     tri_out = attention(q, k, v, causal, sm_scale, warp_specialize).half()
     if mode == "fwd":
-        atol = 3 if "fp8" in provider else 1e-2
-        torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
+        atol = 3 if "fp8" in provider else atol
+        torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=rtol)
         return
     tri_out.backward(dout)
     tri_dv, v.grad = v.grad.clone(), None
     tri_dk, k.grad = k.grad.clone(), None
     tri_dq, q.grad = q.grad.clone(), None
     # compare
-    torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
-    rtol = 0.0
+    torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=rtol)
     # Relative tolerance workaround for known hardware limitation of CDNA2 GPU.
     # For details see https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
     if torch.version.hip is not None and triton.runtime.driver.active.get_current_target().arch == "gfx90a":
-        rtol = 1e-2
-    torch.testing.assert_close(tri_dv, ref_dv, atol=1e-2, rtol=rtol)
-    torch.testing.assert_close(tri_dk, ref_dk, atol=1e-2, rtol=rtol)
-    torch.testing.assert_close(tri_dq, ref_dq, atol=1e-2, rtol=rtol)
+        rtol = max(rtol, 1e-2)
+    torch.testing.assert_close(tri_dv, ref_dv, atol=atol, rtol=rtol)
+    torch.testing.assert_close(tri_dk, ref_dk, atol=atol, rtol=rtol)
+    torch.testing.assert_close(tri_dq, ref_dq, atol=atol, rtol=rtol)
 
 
 @pytest.mark.enable_warmup
