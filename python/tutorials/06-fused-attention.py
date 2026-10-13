@@ -49,7 +49,9 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
                     desc_k, desc_v,  #
                     off_hz, dtype: tl.constexpr, start_m, qk_scale,  #
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
-                    STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
+                    # offs_m/offs_n 为张量: 上游 triton main 的 constexpr tensor 特性,
+                    # triton-ascend 不支持张量绑定到 tl.constexpr, 去掉标注改为运行时计算 (语义不变)
+                    STAGE: tl.constexpr, offs_m, offs_n,  #
                     N_CTX: tl.constexpr, warp_specialize: tl.constexpr, IS_HOPPER: tl.constexpr):
     # range of values handled by this stage
     if STAGE == 1:
