@@ -736,47 +736,48 @@ except BaseException:
     HAS_FLASH = False
 
 TORCH_HAS_FP8 = hasattr(torch, 'float8_e5m2')
-BATCH, N_HEADS = 4, 32
-# vary seq length for fixed head and batch=4
+# 与 test_op 的 7 个 case 完全一致: (Z, H, N_CTX, HEAD_DIM), causal 恒为 True, dtype 为 bf16
+FA_CASES = [
+    (8, 8, 2432, 64),   # case1: seqlen=[2432]*8,  head_dim=64
+    (8, 8, 320, 64),    # case2: seqlen=[320]*8
+    (8, 16, 32, 32),    # case3: seqlen=[32]*8
+    (8, 16, 64, 32),    # case4: seqlen=[64]*8
+    (8, 8, 32, 64),     # case5: seqlen=[32]*8
+    (8, 4, 118, 128),   # case6: seqlen=[118]*8
+    (32, 8, 256, 64),   # case7: seqlen=[256]*32
+]
 configs = []
-for HEAD_DIM in [64, 128]:
-    for mode in ["fwd", "bwd"]:
-        for causal in [True, False]:
-            # Enable warpspec for causal fwd on Hopper
-            enable_ws = mode == "fwd" and (is_blackwell() or (is_hopper() and not causal))
-            for warp_specialize in [False, True] if enable_ws else [False]:
-                configs.append(
-                    triton.testing.Benchmark(
-                        x_names=["N_CTX"],
-                        x_vals=[2**i for i in range(10, 15)],
-                        line_arg="provider",
-                        line_vals=["triton-fp16"] + (["triton-fp8"] if TORCH_HAS_FP8 else []) +
-                        (["flash"] if HAS_FLASH else []),
-                        line_names=["Triton [FP16]"] + (["Triton [FP8]"] if TORCH_HAS_FP8 else []) +
-                        (["Flash-2"] if HAS_FLASH else []),
-                        styles=[("red", "-"), ("blue", "-"), ("green", "-")],
-                        ylabel="TFLOPS",
-                        plot_name=
-                        f"fused-attention-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}-{mode}-causal={causal}-warp_specialize={warp_specialize}",
-                        args={
-                            "H": N_HEADS,
-                            "BATCH": BATCH,
-                            "HEAD_DIM": HEAD_DIM,
-                            "mode": mode,
-                            "causal": causal,
-                            "warp_specialize": warp_specialize,
-                        },
-                    ))
+for mode in ["fwd", "bwd"]:
+    configs.append(
+        triton.testing.Benchmark(
+            x_names=["BATCH", "H", "N_CTX", "HEAD_DIM"],
+            x_vals=list(FA_CASES),
+            line_arg="provider",
+            line_vals=["triton-bf16"],
+            line_names=["Triton [bf16]"],
+            styles=[("red", "-")],
+            ylabel="TFLOPS",
+            plot_name=f"fused-attention-fa-cases-{mode}",
+            args={
+                "causal": True,
+                "warp_specialize": False,
+                "mode": mode,
+            },
+        ))
 
 
 @triton.testing.perf_report(configs)
 def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, device=DEVICE):
     assert mode in ["fwd", "bwd"]
-    dtype = torch.float16
+    # 与 test_op 同口径: bf16; kernel 无边界 mask, 非 128 倍数的 N_CTX 尾部 pad 到 128 倍数,
+    # TFLOPS 按真实 N_CTX 的 FLOPs / 实测耗时计算 (padded 区开销计入耗时, 结果偏保守)
+    dtype = torch.bfloat16
     if "triton" in provider:
-        q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-        k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-        v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        pad_len = -N_CTX % 128
+        size = N_CTX + pad_len
+        q = torch.randn((BATCH, H, size, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        k = torch.randn((BATCH, H, size, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        v = torch.randn((BATCH, H, size, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
         if mode == "fwd" and "fp8" in provider:
             q = q.to(torch.float8_e5m2)
             k = k.to(torch.float8_e5m2)
