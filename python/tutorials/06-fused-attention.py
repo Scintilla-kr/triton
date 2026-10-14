@@ -191,7 +191,6 @@ def _attn_fwd(sm_scale, M,  #
               warp_specialize: tl.constexpr,  #
               IS_HOPPER: tl.constexpr,  #
               ):
-    dtype = tl.float8e5 if FP8_OUTPUT else tl.float16
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
@@ -226,6 +225,8 @@ def _attn_fwd(sm_scale, M,  #
     qk_scale *= 1.44269504  # 1/log(2)
     # load q: it will stay in SRAM throughout
     q = desc_q.load([qo_offset_y, 0])
+    # dot 的算子 dtype 与输入一致 (fp16/bf16), fp8 时 p 转为 v 的 fp8e5
+    dtype = tl.float8e5 if FP8_OUTPUT else q.dtype
     # stage 1: off-band
     # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
     # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
@@ -306,14 +307,14 @@ def _attn_bwd_dkdv(dk, dv,  #
         do = tl.load(do_ptrs)
         # Compute dV.
         ppT = pT
-        ppT = ppT.to(tl.float16)
+        ppT = ppT.to(do.dtype)
         dv += tl.dot(ppT, do)
         # D (= delta) is pre-divided by ds_scale.
         Di = tl.load(D + offs_m)
         # Compute dP and dS.
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
         dsT = pT * (dpT - Di[None, :])
-        dsT = dsT.to(tl.float16)
+        dsT = dsT.to(qT.dtype)
         dk += tl.dot(dsT, tl.trans(qT))
         # Increment pointers.
         curr_m += step_m
@@ -359,7 +360,7 @@ def _attn_bwd_dq(dq, q, K, V,  #
         # Compute dP and dS.
         dp = tl.dot(do, vT).to(tl.float32)
         ds = p * (dp - Di[:, None])
-        ds = ds.to(tl.float16)
+        ds = ds.to(kT.dtype)
         # Compute dQ.
         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
         dq += tl.dot(ds, tl.trans(kT))
@@ -753,8 +754,8 @@ for mode in ["fwd", "bwd"]:
             x_names=["BATCH", "H", "N_CTX", "HEAD_DIM"],
             x_vals=list(FA_CASES),
             line_arg="provider",
-            line_vals=["triton-fp16"],
-            line_names=["Triton [FP16]"],
+            line_vals=["triton-bf16"],
+            line_names=["Triton [bf16]"],
             styles=[("red", "-")],
             ylabel="Latency (us)",
             plot_name=f"fused-attention-fa-cases-{mode}",
@@ -769,11 +770,9 @@ for mode in ["fwd", "bwd"]:
 @triton.testing.perf_report(configs)
 def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, device=DEVICE):
     assert mode in ["fwd", "bwd"]
-    # 注: kernel 内 tl.dot 的 dtype 由 _attn_fwd 启动参数硬编码为 fp16, bf16 输入会
-    # "Both operands must be same dtype. Got fp16 and bf16", 故 benchmark 暂用 fp16
-    # 与 test_op 同口径: kernel 无边界 mask, 非 128 倍数的 N_CTX 尾部 pad 到 128 倍数,
-    # TFLOPS 按真实 N_CTX 的 FLOPs / 实测耗时计算 (padded 区开销计入耗时, 结果偏保守)
-    dtype = torch.float16
+    # 与 test_op 同口径: bf16; kernel 无边界 mask, 非 128 倍数的 N_CTX 尾部 pad 到 128 倍数,
+    # 耗时按实测计算 (padded 区开销计入, 结果偏保守)
+    dtype = torch.bfloat16
     if "triton" in provider:
         pad_len = -N_CTX % 128
         size = N_CTX + pad_len
