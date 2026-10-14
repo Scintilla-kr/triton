@@ -756,7 +756,7 @@ for mode in ["fwd", "bwd"]:
             line_vals=["triton-fp16"],
             line_names=["Triton [FP16]"],
             styles=[("red", "-")],
-            ylabel="TFLOPS",
+            ylabel="Latency (us)",
             plot_name=f"fused-attention-fa-cases-{mode}",
             args={
                 "causal": True,
@@ -787,12 +787,23 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, warp_specialize, mo
             v = v.permute(0, 1, 3, 2)
             v = v.to(torch.float8_e5m2)
         sm_scale = 1.3
-        fn = lambda: attention(q, k, v, causal, sm_scale, warp_specialize)
-        if mode == "bwd":
-            o = fn()
-            do = torch.randn_like(o)
-            fn = lambda: o.backward(do, retain_graph=True)
-        ms = triton.testing.do_bench(fn)
+        try:
+            fn = lambda: attention(q, k, v, causal, sm_scale, warp_specialize)
+            if mode == "bwd":
+                o = fn()
+                do = torch.randn_like(o)
+                fn = lambda: o.backward(do, retain_graph=True)
+            ms = triton.testing.do_bench(fn)
+        except Exception as exc:
+            # NPU UB overflow: 编译期资源不足 (如大 tile 配置 "requires X bits while Y bits available"),
+            # 跳过该 case 记为 nan, 不中断整体 benchmark; 其他异常照常抛出
+            msg = str(exc).lower()
+            if ("ub overflow" in msg or "out of resource" in msg or "bits while" in msg
+                    or "exceed" in msg and "limit" in msg):
+                print(f"[skip] UB overflow at BATCH={BATCH}, H={H}, N_CTX={N_CTX}, HEAD_DIM={HEAD_DIM}, "
+                      f"mode={mode}: {type(exc).__name__}")
+                return float("nan")
+            raise
 
     if provider == "flash":
         qkv = torch.randn((BATCH, N_CTX, 3, H, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
@@ -802,13 +813,8 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, warp_specialize, mo
             do = torch.randn_like(o)
             fn = lambda: o.backward(do, retain_graph=True)
         ms = triton.testing.do_bench(fn)
-    flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * HEAD_DIM
-    total_flops = 2 * flops_per_matmul
-    if causal:
-        total_flops *= 0.5
-    if mode == "bwd":
-        total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
-    return total_flops * 1e-12 / (ms * 1e-3)
+    # 指标改为耗时 (us)
+    return ms * 1e3
 
 
 if __name__ == "__main__":
