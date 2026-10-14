@@ -753,8 +753,8 @@ for mode in ["fwd", "bwd"]:
             x_names=["BATCH", "H", "N_CTX", "HEAD_DIM"],
             x_vals=list(FA_CASES),
             line_arg="provider",
-            line_vals=["triton-bf16"],
-            line_names=["Triton [bf16]"],
+            line_vals=["triton-fp16"],
+            line_names=["Triton [FP16]"],
             styles=[("red", "-")],
             ylabel="TFLOPS",
             plot_name=f"fused-attention-fa-cases-{mode}",
@@ -769,9 +769,11 @@ for mode in ["fwd", "bwd"]:
 @triton.testing.perf_report(configs)
 def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, device=DEVICE):
     assert mode in ["fwd", "bwd"]
-    # 与 test_op 同口径: bf16; kernel 无边界 mask, 非 128 倍数的 N_CTX 尾部 pad 到 128 倍数,
+    # 注: kernel 内 tl.dot 的 dtype 由 _attn_fwd 启动参数硬编码为 fp16, bf16 输入会
+    # "Both operands must be same dtype. Got fp16 and bf16", 故 benchmark 暂用 fp16
+    # 与 test_op 同口径: kernel 无边界 mask, 非 128 倍数的 N_CTX 尾部 pad 到 128 倍数,
     # TFLOPS 按真实 N_CTX 的 FLOPs / 实测耗时计算 (padded 区开销计入耗时, 结果偏保守)
-    dtype = torch.bfloat16
+    dtype = torch.float16
     if "triton" in provider:
         pad_len = -N_CTX % 128
         size = N_CTX + pad_len
